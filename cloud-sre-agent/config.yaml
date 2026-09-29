@@ -1,0 +1,152 @@
+# Cloud SRE Agent — sample configuration.
+# Environment overrides use the SRE_ prefix with __ for nesting, e.g.
+#   SRE_LLM__MODEL=gemini-2.5-pro  ->  llm.model
+#   SRE_OUTPUT__DIR=/var/patches   ->  output.dir
+
+sources:
+  - type: file
+    path: ./testdata/sample.log
+  # Pub/Sub source: pulls Cloud Logging LogEntry JSON from a pull subscription.
+  # Wire a Cloud Logging sink to a Pub/Sub topic, then point this at the topic's
+  # pull subscription. Authentication uses ambient GCP credentials (ADC).
+  # HIPAA: raw message payloads are never logged — only message IDs and counts.
+  # - type: pubsub
+  #   project_id: my-gcp-project
+  #   subscription_id: sre-agent-logs-sub
+
+# LLM provider chain: a PRIMARY provider plus an ordered list of FALLBACKS.
+# Each generation is tried against the primary first; on failure the router
+# advances to each fallback in order. The primary is expressed by the top-level
+# fields below; fallbacks are listed under `fallbacks:`.
+#
+# Provider kinds:
+#   gemini    — Google Gemini, via Vertex AI (BAA-eligible default) or the
+#               consumer Developer API (gated, see allow_non_baa).
+#   openai    — OpenAI (external third party; gated, see allow_external).
+#   anthropic — Anthropic (external third party; gated, see allow_external).
+#   ollama    — local/self-hosted model server. NOT an external third party:
+#               prompt content stays on infrastructure you control, so it is
+#               EXEMPT from the allow_external gate and needs no API key. Set a
+#               `host` (defaults to http://localhost:11434).
+#               IMPORTANT: the `host` MUST resolve to infrastructure within your
+#               HIPAA control boundary. Pointing it at a third-party
+#               "Ollama-compatible" endpoint reintroduces external disclosure
+#               WITHOUT the allow_external gate — the code cannot detect this.
+#   stub      — NON-PRODUCTION, offline provider for dev/dogfooding/CI. Makes no
+#               network call and contacts no external service, so it is EXEMPT
+#               from the allow_external gate and needs no API key, host, or
+#               model. It returns deterministic, schema-valid canned output so
+#               the pipeline runs end to end with no LLM. DO NOT use in
+#               production. Example primary: `provider: stub` / `model: stub`.
+#
+# HIPAA gate: openai and anthropic are EXTERNAL third parties NOT covered by
+# Google's BAA. Selecting either (as primary or fallback) is refused at startup
+# unless you explicitly opt in via `allow_external: true` or the env var
+# SRE_ALLOW_EXTERNAL_LLM=1. This is an auditable acknowledgement that prompt
+# content (which may include log data) is disclosed to that provider. Opting in
+# PRESUMES you have a signed BAA with the vendor AND zero-data-retention (ZDR)
+# enabled on the account; the code cannot verify ZDR, so this is on you. Keeping
+# Gemini-via-Vertex as primary is the safe HIPAA-covered default.
+#
+# API keys are NEVER stored here. They are read from the environment at startup
+# and never logged:
+#   gemini (gemini-api backend) -> the env var named by api_key_env
+#   openai                       -> OPENAI_API_KEY
+#   anthropic                    -> ANTHROPIC_API_KEY
+llm:
+  provider: gemini
+  model: gemini-2.5-flash
+  # Backend selects the Google API. "vertex" (Vertex AI) is the default and the
+  # only BAA-eligible / HIPAA-covered option; it requires project + location.
+  # "gemini-api" is the consumer Gemini Developer API and is NOT covered by
+  # Google's BAA — it is refused at startup unless explicitly opted in (see
+  # allow_non_baa / SRE_ALLOW_NON_BAA below).
+  backend: vertex
+  project: my-gcp-project
+  location: us-central1
+  # Used only by the gemini-api backend. The API key is read from this
+  # environment variable, never stored here.
+  api_key_env: GEMINI_API_KEY
+  # Explicit, auditable acknowledgement required to use the non-BAA gemini-api
+  # backend. Either this bool or the env var SRE_ALLOW_NON_BAA=1 must be set.
+  # allow_non_baa: false
+  # Explicit, auditable acknowledgement required to use ANY external provider
+  # (openai/anthropic) as primary or fallback. Either this bool or the env var
+  # SRE_ALLOW_EXTERNAL_LLM=1 must be set. Leave false for the safe default.
+  # allow_external: false
+  # Ordered fallback chain, tried after the primary fails. Each entry needs a
+  # kind and model; provider-specific fields mirror the primary. Example (kept
+  # commented — uncommenting the external entries also requires allow_external):
+  # fallbacks:
+  #   - kind: gemini
+  #     model: gemini-2.5-pro
+  #     backend: vertex
+  #     project: my-gcp-project
+  #     location: us-central1
+  #   - kind: openai
+  #     model: gpt-4o-mini
+  #     # base_url: https://my-compatible-gateway.example.com   # optional host override
+  #   - kind: anthropic
+  #     model: claude-opus-4-8
+  #   - kind: ollama          # local/self-hosted; no allow_external, no API key
+  #     model: llama3.1
+  #     host: http://localhost:11434   # optional; this is the default
+
+output:
+  dir: ./out
+
+# Delivery target: where a remediation is delivered.
+#   local  — write the patch and a JSON metadata sidecar under output.dir (default).
+#   github — open a real pull request against the repository below.
+#   gitlab — open a real merge request against the project below.
+target: local
+
+# GitHub delivery target (used only when target: github). The access token is
+# NEVER stored here — it is read from the GITHUB_TOKEN environment variable at
+# startup and is never logged. owner and repo are required when target: github.
+github:
+  owner: my-org
+  repo: my-repo
+  # Branch PRs target and branch from; defaults to "main".
+  base_branch: main
+
+# GitLab delivery target (used only when target: gitlab). The access token is
+# NEVER stored here — it is read from the GITLAB_TOKEN environment variable at
+# startup and is never logged. project is required when target: gitlab.
+gitlab:
+  # Project path ("group/repo") or numeric project ID.
+  project: my-group/my-repo
+  # Branch MRs target and branch from; defaults to "main".
+  base_branch: main
+  # API base URL for self-managed GitLab; omit (or leave blank) for gitlab.com.
+  # base_url: https://gitlab.example.com
+
+# Code validator: gates an LLM-generated patch before it is delivered.
+#   none   — accept every patch (default).
+#   local  — validate Go patches with the local toolchain (parse, gofmt, go vet).
+validator: none
+
+# Optional persistent incident memory backed by Hindsight. It recalls related,
+# previously sanitized incident outcomes before LLM calls and retains new
+# outcomes after triage/remediation. Hindsight's API key is read from the
+# environment variable named below (HINDSIGHT_API_KEY by default), never YAML.
+# For self-hosted Hindsight the key may be omitted.
+hindsight:
+  enabled: false
+  # url: http://localhost:8888
+  # bank_id: cloud-sre-agent
+  api_key_env: HINDSIGHT_API_KEY
+
+log:
+  level: info
+  format: json
+
+# Tracing selects the OpenTelemetry span exporter.
+#   none       — spans are recorded in the SDK but not exported (default).
+#   stdout     — spans are written to the process's log writer (local debug).
+#   cloudtrace — spans are exported to Google Cloud Trace (requires project).
+# HIPAA: span attributes must be sanitized before recording — raw log content,
+# prompts, and error strings can carry PHI.
+tracing:
+  exporter: none
+  # project: my-gcp-project  # required only for the cloudtrace exporter
